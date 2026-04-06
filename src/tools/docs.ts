@@ -3315,17 +3315,74 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     appendParagraphHandler as any
   );
 
+  function resolveParagraphInsertTarget(blocks: Y.Map<any>, placement?: AppendPlacement) {
+    let parentId: string;
+    let children: Y.Array<any>;
+    let insertIndex: number;
+
+    if (placement?.afterBlockId) {
+      const refBlock = findBlockById(blocks, placement.afterBlockId);
+      if (!refBlock) throw new Error(`afterBlockId '${placement.afterBlockId}' not found`);
+      const refParentId = resolveBlockParentId(blocks, placement.afterBlockId);
+      if (!refParentId) throw new Error(`Block '${placement.afterBlockId}' has no parent`);
+      parentId = refParentId;
+      const parentBlock = blocks.get(parentId);
+      children = parentBlock.get("sys:children") as Y.Array<any>;
+      insertIndex = Array.from(children).indexOf(placement.afterBlockId) + 1;
+    } else if (placement?.beforeBlockId) {
+      const refBlock = findBlockById(blocks, placement.beforeBlockId);
+      if (!refBlock) throw new Error(`beforeBlockId '${placement.beforeBlockId}' not found`);
+      const refParentId = resolveBlockParentId(blocks, placement.beforeBlockId);
+      if (!refParentId) throw new Error(`Block '${placement.beforeBlockId}' has no parent`);
+      parentId = refParentId;
+      const parentBlock = blocks.get(parentId);
+      children = parentBlock.get("sys:children") as Y.Array<any>;
+      insertIndex = Array.from(children).indexOf(placement.beforeBlockId);
+    } else if (placement?.parentId) {
+      parentId = placement.parentId;
+      const parentBlock = blocks.get(parentId);
+      if (!parentBlock) throw new Error(`parentId '${placement.parentId}' not found`);
+      children = parentBlock.get("sys:children") as Y.Array<any>;
+      insertIndex = placement.index !== undefined ? placement.index : children.length;
+    } else {
+      const pageBlockId = findBlockIdByFlavour(blocks, "affine:page");
+      if (!pageBlockId) throw new Error("Document has no page block");
+      const noteBlockId = findBlockIdByFlavour(blocks, "affine:note");
+      if (!noteBlockId) throw new Error("Document has no note block");
+      parentId = noteBlockId;
+      const parentBlock = blocks.get(parentId);
+      children = parentBlock.get("sys:children") as Y.Array<any>;
+      insertIndex = children.length;
+    }
+
+    return { parentId, children, insertIndex };
+  }
+
+  function insertParagraphBlockWithDeltas(blocks: Y.Map<any>, deltas: TextDelta[], placement?: AppendPlacement) {
+    const { children, insertIndex } = resolveParagraphInsertTarget(blocks, placement);
+    const blockId = generateId();
+    const block = new Y.Map<any>();
+    setSysFields(block, blockId, "affine:paragraph");
+    block.set("sys:parent", null);
+    block.set("sys:children", new Y.Array<string>());
+    block.set("prop:type", "text");
+    block.set("prop:text", makeText(deltas));
+
+    blocks.set(blockId, block);
+    if (insertIndex >= children.length) {
+      children.push([blockId]);
+    } else {
+      children.insert(insertIndex, [blockId]);
+    }
+    return blockId;
+  }
+
   const appendInlineLinkHandler = async (parsed: {
     workspaceId?: string;
     docId: string;
     text: string;
     url: string;
-    placement?: {
-      parentId?: string;
-      afterBlockId?: string;
-      beforeBlockId?: string;
-      index?: number;
-    };
+    placement?: AppendPlacement;
   }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required");
@@ -3347,74 +3404,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       const prevSV = Y.encodeStateVector(doc);
       const blocks = doc.getMap("blocks") as Y.Map<any>;
-
-      // Find the note block to insert into
-      let parentId: string | undefined;
-      let children: Y.Array<any>;
-      let insertIndex: number;
-
-      const placement = parsed.placement;
-
-      if (placement?.afterBlockId) {
-        const refBlock = findBlockById(blocks, placement.afterBlockId);
-        if (!refBlock) throw new Error(`afterBlockId '${placement.afterBlockId}' not found`);
-        const refParentId = resolveBlockParentId(blocks, placement.afterBlockId);
-        if (!refParentId) throw new Error(`Block '${placement.afterBlockId}' has no parent`);
-        parentId = refParentId;
-        const parentBlock = blocks.get(parentId);
-        children = parentBlock.get("sys:children") as Y.Array<any>;
-        insertIndex = Array.from(children).indexOf(placement.afterBlockId) + 1;
-      } else if (placement?.beforeBlockId) {
-        const refBlock = findBlockById(blocks, placement.beforeBlockId);
-        if (!refBlock) throw new Error(`beforeBlockId '${placement.beforeBlockId}' not found`);
-        const refParentId = resolveBlockParentId(blocks, placement.beforeBlockId);
-        if (!refParentId) throw new Error(`Block '${placement.beforeBlockId}' has no parent`);
-        parentId = refParentId;
-        const parentBlock = blocks.get(parentId);
-        children = parentBlock.get("sys:children") as Y.Array<any>;
-        insertIndex = Array.from(children).indexOf(placement.beforeBlockId);
-      } else if (placement?.parentId) {
-        parentId = placement.parentId;
-        const parentBlock = blocks.get(parentId);
-        if (!parentBlock) throw new Error(`parentId '${placement.parentId}' not found`);
-        children = parentBlock.get("sys:children") as Y.Array<any>;
-        insertIndex = placement.index !== undefined ? placement.index : children.length;
-      } else {
-        // Default: find the note block
-        const pageBlockId = findBlockIdByFlavour(blocks, "affine:page");
-        if (!pageBlockId) throw new Error("Document has no page block");
-        const noteBlockId = findBlockIdByFlavour(blocks, "affine:note");
-        if (!noteBlockId) throw new Error("Document has no note block");
-        parentId = noteBlockId;
-        const parentBlock = blocks.get(parentId);
-        children = parentBlock.get("sys:children") as Y.Array<any>;
-        insertIndex = children.length;
-      }
-
-      // Create paragraph block with inline link using Delta format
-      const blockId = generateId();
-      const block = new Y.Map<any>();
-      setSysFields(block, blockId, "affine:paragraph");
-      block.set("sys:parent", null);
-      block.set("sys:children", new Y.Array<string>());
-      block.set("prop:type", "text");
-      block.set("prop:link", parsed.url);  // Add link property at block level
-
-      // Create Y.Text with link mark using Delta format
-      // BlockSuite/AFFiNE might use "href" as the attribute key for links
-      const yText = new Y.Text();
-      yText.applyDelta([
-        { insert: parsed.text, attributes: { href: parsed.url } }
-      ]);
-      block.set("prop:text", yText);
-
-      // Insert block
-      blocks.set(blockId, block);
-      if (insertIndex >= children.length) {
-        children.push([blockId]);
-      } else {
-        children.insert(insertIndex, [blockId]);
-      }
+      const blockId = insertParagraphBlockWithDeltas(
+        blocks,
+        [{ insert: parsed.text, attributes: { link: parsed.url } }],
+        parsed.placement
+      );
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
       await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
@@ -3446,6 +3440,83 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       },
     },
     appendInlineLinkHandler as any
+  );
+
+  const appendRichParagraphHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    segments: Array<{ text: string; url?: string }>;
+    placement?: AppendPlacement;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    if (!parsed.docId) throw new Error("docId is required");
+    if (!Array.isArray(parsed.segments) || parsed.segments.length === 0) {
+      throw new Error("segments must be a non-empty array");
+    }
+
+    const deltas: TextDelta[] = parsed.segments.map((segment, index) => {
+      if (!segment || typeof segment.text !== "string") {
+        throw new Error(`segments[${index}].text is required`);
+      }
+      if (segment.text.length === 0) {
+        throw new Error(`segments[${index}].text must not be empty`);
+      }
+      return segment.url
+        ? { insert: segment.text, attributes: { link: segment.url } }
+        : { insert: segment.text };
+    });
+
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (snapshot.missing) {
+        Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      }
+
+      const prevSV = Y.encodeStateVector(doc);
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const blockId = insertParagraphBlockWithDeltas(blocks, deltas, parsed.placement);
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({ ok: true, docId: parsed.docId, blockId, segments: parsed.segments.length });
+    } finally {
+      socket.close();
+    }
+  };
+
+  server.registerTool(
+    "append_rich_paragraph",
+    {
+      title: "Append Rich Paragraph",
+      description: "Append a paragraph containing mixed plain text and inline hyperlinks.",
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        docId: z.string(),
+        segments: z.array(
+          z.object({
+            text: z.string(),
+            url: z.string().optional(),
+          })
+        ).min(1),
+        placement: z
+          .object({
+            parentId: z.string().optional(),
+            afterBlockId: z.string().optional(),
+            beforeBlockId: z.string().optional(),
+            index: z.number().int().min(0).optional(),
+          })
+          .optional(),
+      },
+    },
+    appendRichParagraphHandler as any
   );
 
   const appendBlockHandler = async (parsed: {
